@@ -1,0 +1,19 @@
+#Default requirments (gotten from week 6 content)
+
+# Core LangChain/LangGraph
+langchain
+langchain-core
+langchain-openai
+langgraph
+
+# LangGraph CLI for LangSmith Studio
+langgraph-cli[inmem]
+
+# LangSmith for tracing
+langsmith
+
+# Data validation
+pydantic
+
+# Environment management
+python-dotenv
