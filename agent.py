@@ -1,3 +1,5 @@
+import os
+import traceback
 from dotenv import load_dotenv
 from typing import Annotated, Optional
 from pydantic import BaseModel
@@ -7,6 +9,10 @@ from langgraph.graph.message import add_messages
 from langchain_core.tools import tool
 from langgraph.errors import Interrupt
 from langchain.chat_models import init_chat_model
+from pinecone import Pinecone
+from langchain_openai import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain_core.messages import HumanMessage
 
 from adapters.gold_mock import GOLD_ORDER_LOOKUP, GOLD_RISK_LOOKUP
 # from adapters.snowflake_adapter import fetch_gold_order
@@ -14,12 +20,48 @@ from adapters.gold_mock import GOLD_ORDER_LOOKUP, GOLD_RISK_LOOKUP
 # Load environment variables
 load_dotenv()
 
+# Ensure envionment variables are set
+required_env_vars = (
+    "PINECONE_API_KEY",
+    "OPENAI_API_KEY"
+)
+debug_env_vars = (
+    "LANGSMITH_PROJECT",
+    "LANGSMITH_API_KEY",
+    "LANGSMITH_ENDPOINT",
+    "LANGSMITH_TRACING"
+)
+for r in required_env_vars:
+    if r not in os.environ:
+        raise EnvironmentError(f"Missing required environment variable: {r}")
+for d in debug_env_vars:
+    if d not in os.environ:
+        print(f"Warning: Missing debug environment variable: {d}")
+
 # Initialize model
 model = init_chat_model("openai:gpt-4o-mini")
 
+# ========================== Pinecone Setup ==========================
+
+pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+
+# Must match dimensions for OpenAIEmbeddings
+index = pc.Index("project-6-ecommerce-agent")
+
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-large",
+    dimensions=1024
+)
+
+vectorstore = PineconeVectorStore(
+    index=index,
+    embedding=embeddings,
+    text_key="text"
+)
+
 # ========================== Tools ==========================
 
-@tool
+# @tool
 def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
         """
         Fetches Gold-layer order and risk data for a given user and order.
@@ -35,15 +77,22 @@ def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
         }
         
 
-@tool
+# @tool
 def fetch_from_pinecone(item_category: str) -> dict:
     """
-    Retrieves the return/refund policy clause relevant to the item category.
-    This mock implementation simulates Pinecone vector search results.
+    Retrieves the refund policy clause for the given item category
+    from Pinecone using metadata filtering.
     """
-    return{
-        "policy_clause": "Electronics are eligible for return within 30 days."
-    }
+
+    results = vectorstore.similarity_search(
+        query=item_category,
+        k=1
+    )
+
+    if not results:
+        return {"policy_clause": "No refund policy found for this category."}
+
+    return {"policy_clause": results[0].page_content}
 
 # ========================== State ==========================
 
@@ -62,7 +111,7 @@ class AgentState(BaseModel):
     # order context (Gold)
     item_category: Optional[str] = None
     order_date: Optional[str] = None
-    item_price_usd: Optional[str] = None
+    item_price_usd: Optional[float] = None
  
     # fraud signals (Gold)
     refund_count_window: Optional[int] = None
@@ -95,7 +144,7 @@ def identity_gate_node(state: AgentState) -> dict:
 
 # Fetch the order date, item category, and transactional data (even user login)
 # via Pydantic-validated models
-def snowflake_node(state: AgentState) -> dict:
+def snowflake_node(state: AgentState) -> dict:   
     data = fetch_from_snowflake(state.user_id, state.order_id)   
     return data
 
@@ -164,3 +213,47 @@ def build_graph():
     builder.add_edge("human_review", END)
 
     return builder.compile()
+
+def run_test_case(
+    user_message: str,
+    user_id: str,
+    order_id: str,
+    identity_verified: bool = True,
+):
+    graph = build_graph()
+
+    initial_state = AgentState(
+        messages=[HumanMessage(content=user_message)],
+        user_id=user_id,
+        order_id=order_id,
+        identity_verified=identity_verified,
+    )
+
+    try:
+        final_state = graph.invoke(initial_state)
+        return final_state
+    except Exception as e:
+        print("Execution halted:")
+        traceback.print_exc()
+        return None
+
+def main():
+    print("=== Running Agent Test ===")
+
+    # Sample refund-related query (returns dict)
+    result = run_test_case(
+        user_message="I want a refund for my order",
+        user_id="user_123",
+        order_id="order_456",
+        identity_verified=True,  # bypass identity gate for testing
+    )
+
+    if result:
+        print("\n=== FINAL STATE ===")
+        print("Decision Summary:")
+        print(result["decision_summary"])
+
+        print("\nHuman review required:", result["human_review_required"])
+
+if __name__ == "__main__":
+    main()
