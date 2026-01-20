@@ -13,6 +13,9 @@ from pinecone import Pinecone
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.messages import HumanMessage
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
 
 from adapters.gold_mock import GOLD_ORDER_LOOKUP, GOLD_RISK_LOOKUP
 # from adapters.snowflake_adapter import fetch_gold_order
@@ -61,11 +64,11 @@ vectorstore = PineconeVectorStore(
 
 # ========================== Tools ==========================
 
-# @tool
+@tool
 def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
         """
         Fetches Gold-layer order and risk data for a given user and order.
-        This is a mock implementation used for offline demos and testing.
+        This tool **must be called first**.
         """
         # TODO: replace with snowflake connector
         gold_order = GOLD_ORDER_LOOKUP.get(order_id, {})
@@ -74,25 +77,35 @@ def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
         return {
             **gold_order,
             **gold_risk
-        }
-        
+        }        
 
-# @tool
+@tool
 def fetch_from_pinecone(item_category: str) -> dict:
     """
-    Retrieves the refund policy clause for the given item category
-    from Pinecone using metadata filtering.
+    Retrieves the refund policy clause for the given item_category.
+    Only call this **after** fetching Snowflake data to get item_category.
     """
-
     results = vectorstore.similarity_search(
         query=item_category,
         k=1
     )
-
     if not results:
         return {"policy_clause": "No refund policy found for this category."}
 
     return {"policy_clause": results[0].page_content}
+
+tools = [fetch_from_snowflake, fetch_from_pinecone]
+
+# ====================== Create Agent =======================
+
+class RefundPolicy(BaseModel):
+    policy_clause: str
+
+agent = create_agent(
+    model=model,
+    tools=tools,
+    response_format=ToolStrategy(RefundPolicy)
+)
 
 # ========================== State ==========================
 
@@ -153,7 +166,30 @@ def pinecone_node(state: AgentState) -> dict:
     if not state.item_category:
         return {"policy_clause": "No policy available"}
     return fetch_from_pinecone(state.item_category) 
-    
+
+# Retrieves the order based on the user, and order id
+# Crucially, it calls the Snowflake and Pinecone tools sequentially
+# using LLM commands. This may be probablistic and not recommended.
+def retrieval_agent_node(state: AgentState) -> dict:
+    # Prepare a prompt context combining needed state
+    user_input = (
+        f"User said: {state.messages[-1].content}\n"
+        f"User ID: {state.user_id}, Order ID: {state.order_id}\n"
+        # f"Item Category: {state.item_category}"
+    )
+
+    result = agent.invoke({
+        "input": user_input,
+        "messages": state.messages,
+    })
+    # Extract structured policy if present
+    structured = result.get("structured_response")
+    if structured and "policy_clause" in structured:
+        return {"policy_clause": structured["policy_clause"]}
+
+    # Fallback: parse from last model message
+    last_msg = result["messages"][-1].content
+    return {"policy_clause": last_msg}
 
 # Execute fraud and abuse signals.
 def fraud_detection_node(state: AgentState) -> dict:
@@ -164,7 +200,7 @@ def fraud_detection_node(state: AgentState) -> dict:
     if state.address_distance_miles and state.address_distance_miles > 500:
         return {"human_review_required": True}
     
-    return{}
+    return {}
 
 # Generate an explanation for the decision path
 def decision_summary_node(state: AgentState) -> dict:
@@ -182,7 +218,6 @@ def decision_summary_node(state: AgentState) -> dict:
 def human_review_node(state: AgentState) -> dict:
     return {"human_review_required": True}
 
-
 def build_graph():
     builder = StateGraph(AgentState)
 
@@ -190,15 +225,18 @@ def build_graph():
     builder.add_node("identity", identity_gate_node)
     builder.add_node("snowflake", snowflake_node)
     builder.add_node("pinecone", pinecone_node)
+    builder.add_node("retrieval", retrieval_agent_node)
     builder.add_node("fraud", fraud_detection_node)
     builder.add_node("summary", decision_summary_node)
     builder.add_node("human_review", human_review_node)
 
     builder.add_edge(START, "intent")
     builder.add_edge("intent", "identity")
-    builder.add_edge("identity", "snowflake")
-    builder.add_edge("snowflake", "pinecone")
-    builder.add_edge("pinecone", "fraud")
+    # builder.add_edge("identity", "snowflake")
+    # builder.add_edge("snowflake", "pinecone")
+    # builder.add_edge("pinecone", "fraud")
+    builder.add_edge("identity", "retrieval")
+    builder.add_edge("retrieval", "fraud")
     builder.add_edge("fraud", "summary")
 
     builder.add_conditional_edges(
