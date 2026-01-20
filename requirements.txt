@@ -17,3 +17,6 @@ pydantic
 
 # Environment management
 python-dotenv
+
+# Pinecone
+langchain-pinecone
