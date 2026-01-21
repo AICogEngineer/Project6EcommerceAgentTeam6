@@ -1,4 +1,58 @@
+import os
+from dotenv import load_dotenv
+import snowflake.connector
 
+load_dotenv()
 
-#def fetch_gold_order(user_id: str, order_id: str) -> dict:
-    # real sql here
+def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
+    """
+    Read-only Snowflake adapter
+    Maps Snowflake data into agent-compatible fields.
+    """
+
+    ctx = snowflake.connector.connect(
+        user=os.environ["SNOWFLAKE_USER"],
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        account=os.environ["SNOWFLAKE_ACCOUNT"],
+        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+        database=os.environ["SNOWFLAKE_DATABASE"],
+        schema=os.environ["SNOWFLAKE_SCHEMA"],
+        role=os.environ["SNOWFLAKE_ROLE"],
+    )
+
+    print("[SNOWFLAKE] Querying MENU table...")
+
+    cs = ctx.cursor()
+    try:
+        cs.execute("""
+            SELECT
+                p.CATEGORY,
+                s.UNIT_PRICE,
+                s.QUANTITY,
+                s.REVENUE
+            FROM FACT_SALES s
+            JOIN DIM_PRODUCTS p
+              ON s.PRODUCT_ID = p.PRODUCT_ID
+            WHERE s.USER_ID = %s
+            LIMIT 1
+        """, (user_id,))
+
+        row = cs.fetchone()
+
+        if not row:
+            print("[SNOWFLAKE] No rows returned (expected in training env)")
+            return {}
+        
+        category, unit_price, quantity, revenue = row
+
+        return {
+            "item_category": category,
+            "item_price_usd": float(unit_price),
+            "refund_count_window": 0,
+            "chargeback_flag": False,
+            "address_distance_miles": None
+        }
+    
+    finally:
+        cs.close()
+        ctx.close()
