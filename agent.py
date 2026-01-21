@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from langgraph.types import interrupt
 from typing import Literal
+from langgraph.checkpoint.memory import InMemorySaver
 
 from adapters.gold_mock import GOLD_ORDER_LOOKUP, GOLD_RISK_LOOKUP
 # from adapters.snowflake_adapter import fetch_gold_order
@@ -144,10 +145,10 @@ def identity_gate_node(state: AgentState) -> dict:
     if state.identity_verified:
         return {}
     data = interrupt({"message": "Verify identity (email/password)"})
-
+    print(data)
     # resume with data
     return {
-        "identity_verified": True,
+        "identity_verified": data.get("identity_verified"),
         "user_id": "user_123",
         "order_id": "order_456",
         "email": data.get("email")
@@ -223,117 +224,47 @@ def build_graph():
    
     builder.add_edge("human_review", END)
 
-    return builder.compile()
-
-def run_test_case(
-    user_message: str,
-    user_id: str,
-    order_id: str,
-    identity_verified: bool = True,
-):
-    graph = build_graph()
-
-    initial_state = AgentState(
-        messages=[HumanMessage(content=user_message)],
-        user_id=user_id,
-        order_id=order_id,
-        identity_verified=identity_verified,
-    )
-
-    try:
-        final_state = graph.invoke(initial_state)
-        return final_state
-    except Exception as e:
-        print("Execution halted:")
-        traceback.print_exc()
-        return None
-
-# Hardcoded outside of langgraph
-def mock_identity_verification():
-    print("\n=== Identity Verification ===")
-    email = input("Email: ")
-    password = input("Password: ")
-
-    # Accept anything for now
-    print("Identity verified.\n")
-
-    return {
-        "user_id": "user_123",
-        "order_id": "order_456",
-        "identity_verified": True,
-    }
-
+    # InMemoryServer needed to maintain state during interrupts
+    return builder.compile(checkpointer=InMemorySaver())
 
 def interactive_stateful_cli():
     graph = build_graph()
+    config = {"configurable": {"thread_id": "test-1"}}  # Needed for InMemorySaver()
+    state = AgentState(messages=[])
 
-    state = AgentState(
-        messages=[]
+    # Get and add user's first message
+    user_input = input(
+        "\nHello, I am your refund agent! How can I help you today? "
     )
-
-    print("Refund Agent (start from scratch). Type 'exit' to quit.")
-
-
-    user_input = input("\nHello! How can I help you today? ")
-    # if user_input.lower() == "exit" or user_input == "":
-    #     break
-
     state.messages.append(HumanMessage(content=user_input))
+    # Call graph from user's initial message
+    result = graph.invoke(state, config=config)
 
-    # try:
-    result = graph.invoke(state)
-
-    # Case 1: interrupt
+    # If an interrupt was detected (i.e. need identity verification, handle it)
     if "__interrupt__" in result:
-        print(result)
         interrupt_obj = result["__interrupt__"][0]
 
         payload = interrupt_obj.value
         print("\n[AGENT]:", payload["message"])
 
+        # Verify user credentials for their identity (TODO sample creds for now)
         email = input("Email: ")
         password = input("Password: ")
 
         # Resume
-        result = graph.invoke(state, resume={"email": email})
-    # Now we are guaranteed full state
-    state = result
-    print(state)
+        result = graph.invoke(
+            Command(resume={"email": email, "identity_verified": True}),
+            config=config
+        )
 
-    if "decision_summary" in state:
+    # On completion of agent cycle, print the agent's decision
+    if "decision_summary" in result:
         print("\nAgent decision summary:")
-        print(state["decision_summary"])
-
-        # except Interrupt as interrupt:
-        #     print(f"\n[AGENT]: {interrupt}")
-
-        #     # Collect identity info from user
-        #     identity_update = mock_identity_verification()
-
-        #     # Update state with verified identity
-        #     for k, v in identity_update.items():
-        #         setattr(state, k, v)
-
-        #     # Resume execution
-        #     state = graph.invoke(state)
+        print(result["decision_summary"])
 
 def main():
     print("=== Running Agent Test ===")
     interactive_stateful_cli()
-    # # Sample refund-related query (returns dict)
-    # result = run_test_case(
-    #     user_message="I want a refund for my order",
-    #     user_id="user_123",
-    #     order_id="order_456",
-    #     identity_verified=True,  # bypass identity gate for testing
-    # )
-
-    # if result:
-    #     print("\n=== FINAL STATE ===")
-    #     print("Decision Summary:")
-    #     print(result["decision_summary"])
-
-    #     print("\nHuman review required:", result["human_review_required"])
 
 if __name__ == "__main__":
     main()
