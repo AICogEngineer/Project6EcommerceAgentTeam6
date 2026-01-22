@@ -106,6 +106,7 @@ class RefundPolicy(BaseModel):
     policy_clause: str
 
 agent = create_agent(
+    name="refund-policy-agent",
     model=model,
     tools=tools,
     response_format=ToolStrategy(RefundPolicy)
