@@ -3,26 +3,46 @@ from dotenv import load_dotenv
 import snowflake.connector
 
 load_dotenv()
-
-def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
-    """
-    Read-only Snowflake adapter
-    Maps Snowflake data into agent-compatible fields.
-    """
-
-    ctx = snowflake.connector.connect(
+def get_snowflake_connection():
+    return snowflake.connector.connect(
         user=os.environ["SNOWFLAKE_USER"],
         password=os.environ["SNOWFLAKE_PASSWORD"],
         account=os.environ["SNOWFLAKE_ACCOUNT"],
         warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
         database=os.environ["SNOWFLAKE_DATABASE"],
         schema=os.environ["SNOWFLAKE_SCHEMA"],
-        role=os.environ["SNOWFLAKE_ROLE"],
+        role=os.environ["SNOWFLAKE_ROLE"]
     )
 
+def snowflake_verify_user_email(email: str) -> dict: 
+    try:
+        with get_snowflake_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT USER_ID FROM DIM_CUSTOMERS WHERE EMAIL = %s",
+                    (email,)
+                )
+                row = cur.fetchone()
+                return {
+                    "email": email,
+                    "identity_verified": True if row else False,
+                    "user_id": row[0] if row else None
+                }
+    except Exception as e:
+        print("ERROR verifying email in Snowflake:", e)
+        return {
+            "email": email,
+            "identity_verified": False,
+            "user_id": None
+        }
+
+def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
+    """
+    Read-only Snowflake adapter
+    Maps Snowflake data into agent-compatible fields.
+    """
     print("[SNOWFLAKE] Querying MENU table...")
 
-    cs = ctx.cursor()
     try:
         cs.execute("""
             SELECT

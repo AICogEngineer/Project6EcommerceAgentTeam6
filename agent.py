@@ -20,7 +20,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 
-from adapters.snowflake_adapter import fetch_from_snowflake
+from adapters.snowflake_adapter import fetch_from_snowflake, snowflake_verify_user_email
 
 # Load environment variables
 load_dotenv()
@@ -72,7 +72,7 @@ def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
     Fetches Gold-layer order and risk data for a given user and order.
     This is a mock implementation used for offline demos and testing.
     """
-    return fetch_from_snowflake (user_id, order_id)
+    return fetch_from_snowflake(user_id, order_id)
 
 @tool
 def fetch_from_pinecone(item_category: str) -> dict:
@@ -279,14 +279,18 @@ def interactive_stateful_cli():
 
         # Verify user credentials for their identity (TODO sample creds for now)
         email = input("Email: ")
-        password = input("Password: ")
-
-        # Resume
-        result = graph.invoke(
-            Command(resume={"email": email, "identity_verified": True}),
-            config=config
-        )
-
+        verify_results = snowflake_verify_user_email(email)
+        if verify_results["identity_verified"]:
+            # Resume
+            result = graph.invoke(
+                # Contains email, identity_verified, user_id (for querying orders)
+                Command(resume=verify_results),
+                config=config
+            )
+        else:
+            print("Identity verification failed. Exiting.")
+            return
+            
     # On completion of agent cycle, print the agent's decision
     if "decision_summary" in result:
         print("\nAgent decision summary:")
