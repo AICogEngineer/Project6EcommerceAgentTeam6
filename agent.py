@@ -13,6 +13,10 @@ from pinecone import Pinecone
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.messages import HumanMessage
+from langgraph.types import Command
+from langgraph.types import interrupt
+from typing import Literal
+from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 
@@ -117,8 +121,8 @@ class AgentState(BaseModel):
     human_review_required: bool = False
 
     # identity
-    user_id: str
-    order_id: str
+    user_id: Optional[str] = None   # Must consider starting from scratch
+    order_id: Optional[str] = None
     identity_verified: bool = False
 
     # order context (Gold)
@@ -151,9 +155,17 @@ def intent_node(state: AgentState) -> dict:
 # Handle cases where the user needs to verify who they are, such as PII
 # or financial information
 def identity_gate_node(state: AgentState) -> dict:
-    if not state.identity_verified:
-        raise Interrupt("Identity verification required")
-    return {}
+    if state.identity_verified:
+        return {}
+    data = interrupt({"message": "Verify identity (email/password)"})
+    print(data)
+    # resume with data
+    return {
+        "identity_verified": data.get("identity_verified"),
+        "user_id": "user_123",
+        "order_id": "order_456",
+        "email": data.get("email")
+    }
 
 # Fetch the order date, item category, and transactional data (even user login)
 # via Pydantic-validated models
@@ -250,48 +262,47 @@ def build_graph():
    
     builder.add_edge("human_review", END)
 
-    return builder.compile()
+    # InMemoryServer needed to maintain state during interrupts
+    return builder.compile(checkpointer=InMemorySaver())
 
-def run_test_case(
-    user_message: str,
-    user_id: str,
-    order_id: str,
-    identity_verified: bool = True,
-):
+def interactive_stateful_cli():
     graph = build_graph()
+    config = {"configurable": {"thread_id": "test-1"}}  # Needed for InMemorySaver()
+    state = AgentState(messages=[])
 
-    initial_state = AgentState(
-        messages=[HumanMessage(content=user_message)],
-        user_id=user_id,
-        order_id=order_id,
-        identity_verified=identity_verified,
+    # Get and add user's first message
+    user_input = input(
+        "\nHello, I am your refund agent! How can I help you today? "
     )
+    state.messages.append(HumanMessage(content=user_input))
+    # Call graph from user's initial message
+    result = graph.invoke(state, config=config)
 
-    try:
-        final_state = graph.invoke(initial_state)
-        return final_state
-    except Exception as e:
-        print("Execution halted:")
-        traceback.print_exc()
-        return None
+    # If an interrupt was detected (i.e. need identity verification, handle it)
+    if "__interrupt__" in result:
+        interrupt_obj = result["__interrupt__"][0]
+
+        payload = interrupt_obj.value
+        print("\n[AGENT]:", payload["message"])
+
+        # Verify user credentials for their identity (TODO sample creds for now)
+        email = input("Email: ")
+        password = input("Password: ")
+
+        # Resume
+        result = graph.invoke(
+            Command(resume={"email": email, "identity_verified": True}),
+            config=config
+        )
+
+    # On completion of agent cycle, print the agent's decision
+    if "decision_summary" in result:
+        print("\nAgent decision summary:")
+        print(result["decision_summary"])
 
 def main():
     print("=== Running Agent Test ===")
-
-    # Sample refund-related query (returns dict)
-    result = run_test_case(
-        user_message="I want a refund for my order",
-        user_id="user_123",
-        order_id="order_456",
-        identity_verified=True,  # bypass identity gate for testing
-    )
-
-    if result:
-        print("\n=== FINAL STATE ===")
-        print("Decision Summary:")
-        print(result["decision_summary"])
-
-        print("\nHuman review required:", result["human_review_required"])
+    interactive_stateful_cli()
 
 if __name__ == "__main__":
     main()
