@@ -20,3 +20,6 @@ python-dotenv
 
 # Pinecone
 langchain-pinecone
+
+# Snowflake connector
+snowflake-connector-python

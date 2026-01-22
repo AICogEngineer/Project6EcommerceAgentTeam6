@@ -20,9 +20,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 
-
-from adapters.gold_mock import GOLD_ORDER_LOOKUP, GOLD_RISK_LOOKUP
-# from adapters.snowflake_adapter import fetch_gold_order
+from adapters.snowflake_adapter import fetch_from_snowflake
 
 # Load environment variables
 load_dotenv()
@@ -74,15 +72,7 @@ def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
     Fetches Gold-layer order and risk data for a given user and order.
     This is a mock implementation used for offline demos and testing.
     """
-    # TODO: replace with snowflake connector
-    gold_order = GOLD_ORDER_LOOKUP.get(order_id, {})
-    gold_risk = GOLD_RISK_LOOKUP.get(user_id, {})
-
-    return {
-        **gold_order,
-        **gold_risk
-    }
-        
+    return fetch_from_snowflake (user_id, order_id)
 
 @tool
 def fetch_from_pinecone(item_category: str) -> dict:
