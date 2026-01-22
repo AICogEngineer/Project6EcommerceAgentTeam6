@@ -70,18 +70,19 @@ vectorstore = PineconeVectorStore(
 
 @tool
 def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
-        """
-        Fetches Gold-layer order and risk data for a given user and order.
-        This tool **must be called first**.
-        """
-        # TODO: replace with snowflake connector
-        gold_order = GOLD_ORDER_LOOKUP.get(order_id, {})
-        gold_risk = GOLD_RISK_LOOKUP.get(user_id, {})
+    """
+    Fetches Gold-layer order and risk data for a given user and order.
+    This is a mock implementation used for offline demos and testing.
+    """
+    # TODO: replace with snowflake connector
+    gold_order = GOLD_ORDER_LOOKUP.get(order_id, {})
+    gold_risk = GOLD_RISK_LOOKUP.get(user_id, {})
 
-        return {
-            **gold_order,
-            **gold_risk
-        }        
+    return {
+        **gold_order,
+        **gold_risk
+    }
+        
 
 @tool
 def fetch_from_pinecone(item_category: str) -> dict:
