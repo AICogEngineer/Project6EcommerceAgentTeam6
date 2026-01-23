@@ -109,7 +109,7 @@ def snowflake_update_order_refund(transaction_id: str) -> bool:
                 query = """
                     update fact_sales
                     set status = 'refunded'
-                    where transaction_id like= %s
+                    where transaction_id like %s
                     """
                 cur.execute(query, (f"%{transaction_id}%",))
                 conn.commit()

@@ -1,5 +1,7 @@
 import os
 import traceback
+import re
+from datetime import datetime, date
 from dotenv import load_dotenv
 from typing import Annotated, Optional
 from pydantic import BaseModel
@@ -57,8 +59,7 @@ embeddings = OpenAIEmbeddings(
 
 vectorstore = PineconeVectorStore(
     index=index,
-    embedding=embeddings,
-    text_key="text"
+    embedding=embeddings
 )
 
 # ========================== Tools ==========================
@@ -99,6 +100,49 @@ def fetch_from_pinecone(item_category: str) -> dict:
     return {"policy_clause": results[0].page_content}
 
 tools = [fetch_user_orders, fetch_item_category, fetch_from_pinecone]
+
+# ======================= Functions =========================
+default_return_policy = "Return within 30 days"
+
+# Days within return or -1 if you can't return it
+def interpret_return_policy(return_policy: str) -> int:
+    text = return_policy.lower()
+
+    # Non-returnable patterns
+    non_returnable_patterns = [
+        "no returns",
+        "non-refundable",
+        "non returnable",
+        "final sale",
+        "cannot be returned",
+        "no refund"
+    ]
+
+    for pattern in non_returnable_patterns:
+        if pattern in text:
+            return -1
+
+    # Look for "within X days" or "X-day return"
+    match = re.search(r'(\d+)\s*(day|days)', text)
+    if match:
+        return int(match.group(1))
+
+    # Default: unknown policy
+    return -1
+
+def is_return_allowed(order_date, days: int) -> bool:
+    if days == -1:
+        return False  # not returnable
+
+    if isinstance(order_date, date):
+        order_dt = order_date
+    else:
+        order_dt = datetime.strptime(order_date.strip(), "%Y-%m-%d").date()
+
+    today = date.today()
+    days_since = (today - order_dt).days
+
+    return 0 <= days_since <= days
 
 # ====================== Create Agent =======================
 
@@ -194,15 +238,25 @@ def retrieval_agent_node(state: AgentState) -> dict:
     })
     order = snowflake_fetch_order(return_transaction_id)
     item_category = order.get("category")
+    transaction_date = order.get("transaction_date")    # Type <class 'datetime.date'>
     results = vectorstore.similarity_search(
         query=item_category,
-        k=1
+        k=1,
+        include_metadata=True
     )
-    policy_clause = "No refund policy found for this category."
+    # Default is 30 days (if none was found)
+    policy_clause = default_return_policy
     if results:
         policy_clause = results[0].page_content
-    # Mark order as refunded
-    snowflake_update_order_refund(return_transaction_id)
+    # Get the returnable days
+    days_to_return = interpret_return_policy(policy_clause)
+    # Refund if date is within policy
+    if transaction_date and is_return_allowed(transaction_date, days_to_return):
+        # Mark order as refunded
+        snowflake_update_order_refund(return_transaction_id)
+        print("Order updated!")
+    else:
+        print(f"Order {return_transaction_id} is not eligible for return based on policy.")
 
     return {
         "policy_clause": policy_clause,
