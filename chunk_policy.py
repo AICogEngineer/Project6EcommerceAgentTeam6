@@ -4,7 +4,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
-import pinecone
+from pinecone import Pinecone
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -21,71 +21,115 @@ load_dotenv(override=True)
 BASE_DIR = Path(__file__).parent
 POLICY_FILE = BASE_DIR / "docs" / "Generic E-Commerce Company Master Policy Compendium.pdf"
 
-
 INDEX_NAME = "project-6-ecommerce-agent"
 
 EMBEDDING_MODEL = "text-embedding-3-large"
 EMBED_DIM = 1024
 
+# Similarity floor for weak-policy documents
+MIN_SCORE = 0.045
+
+REFUND_KEYWORDS = [
+    "refund",
+    "refunds",
+    "return",
+    "returns",
+    "exchange",
+    "chargeback",
+    "reimbursement",
+    "money back",
+    "cancel",
+    "cancellation"
+]
+
 # =========================
-# Load policy text
+# PDF Loading
 # =========================
 
 def load_policy_text() -> str:
     reader = PdfReader(POLICY_FILE)
-    text = ""
+    pages = []
     for page in reader.pages:
-        text += page.extract_text() + "\n"
-    return text
+        text = page.extract_text()
+        if text:
+            pages.append(text)
+    return "\n".join(pages)
 
 # =========================
-# Section-aware splitter
+# Chunking Helpers
 # =========================
 
-def split_policy(text: str):
-    section_pattern = r"\n(?=\d+\.\s)"
-    sections = re.split(section_pattern, text)
+def has_refund_signal(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in REFUND_KEYWORDS)
+
+def is_useful_length(text: str) -> bool:
+    return len(text.split()) >= 40
+
+# =========================
+# Chunk + Upload (INGESTION)
+# =========================
+
+def chunk_and_upload_policy():
+    print("Loading policy document...")
+    text = load_policy_text()
+
+    print("Chunking policy (weak refund signal)...")
+    sections = re.split(r"\n(?=\d+\.\s)", text)
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=120,
-        separators=["\n\n", "\n", ". ", " "]
+        chunk_size=450,
+        chunk_overlap=80,
+        separators=["\n\n", "\n", ". ", "; ", " "]
     )
 
     chunks = []
 
     for sec in sections:
         header_match = re.match(r"(\d+\.\s[^\n]+)", sec)
-        header = header_match.group(1) if header_match else "General Policy"
+        section_header = header_match.group(1).strip() if header_match else "General Policy"
 
-        for i, chunk in enumerate(splitter.split_text(sec)):
+        body = sec
+        body = re.sub(r"\d+\.\s[^\n]+", "", body, count=1)
+        body = re.sub(r"Page\s+\d+\s+of\s+\d+", "", body, flags=re.IGNORECASE)
+        body = body.strip()
+
+        for i, chunk in enumerate(splitter.split_text(body)):
+            if not has_refund_signal(chunk):
+                continue
+            if not is_useful_length(chunk):
+                continue
+
             chunks.append({
-                "id": f"{header}-{i}",
+                "id": f"{section_header}-{i}",
                 "text": chunk.strip(),
                 "metadata": {
-                    "section": header,
-                    "chunk_id": i
+                    "section": section_header,
+                    "chunk_id": i,
+                    "policy_type": "refund",
+                    "signal_strength": "weak"
                 }
             })
 
-    return chunks
+    if not chunks:
+        print("⚠️ No refund-related chunks found.")
+        return
 
-# =========================
-# Pinecone upload (DIRECT SDK)
-# =========================
+    print(f"Prepared {len(chunks)} chunks")
 
-def upload_chunks(chunks):
-    pc = pinecone.Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
 
     if INDEX_NAME not in [i.name for i in pc.list_indexes()]:
         pc.create_index(
             name=INDEX_NAME,
             dimension=EMBED_DIM,
             metric="cosine",
-            spec=pinecone.ServerlessSpec(
-                cloud="aws",
-                region="us-east-1"
-            )
+            spec={
+                "serverless": {
+                    "cloud": "aws",
+                    "region": "us-east-1"
+                }
+            }
         )
 
     index = pc.Index(INDEX_NAME)
@@ -96,34 +140,76 @@ def upload_chunks(chunks):
     )
 
     vectors = []
-
     for chunk in chunks:
         vector = embeddings.embed_query(chunk["text"])
-        vectors.append((
-            chunk["id"],
-            vector,
-            chunk["metadata"]
-        ))
+        vectors.append((chunk["id"], vector, chunk["metadata"]))
 
     index.upsert(vectors=vectors)
 
-    print(f"Uploaded {len(vectors)} policy chunks to Pinecone")
+    print(f"Uploaded {len(vectors)} refund-related policy chunks")
 
 # =========================
-# Main
+# Retriever (RUNTIME)
 # =========================
 
-def main():
-    print("Loading policy document...")
-    text = load_policy_text()
+def retrieve_refund_policy(query: str, top_k: int = 10) -> dict:
+    """
+    Refund-aware retriever for weak-signal policy documents.
+    """
 
-    print("Chunking policy...")
-    chunks = split_policy(text)
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    index = pc.Index(INDEX_NAME)
 
-    print("Uploading to Pinecone...")
-    upload_chunks(chunks)
+    embeddings = OpenAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        dimensions=EMBED_DIM
+    )
 
-    print("Done.")
+    query_vector = embeddings.embed_query(query)
+
+    results = index.query(
+        vector=query_vector,
+        top_k=top_k,
+        include_metadata=True,
+        filter={"policy_type": "refund"}
+    )
+
+    matches = [
+        m for m in results.get("matches", [])
+        if m.get("score", 0) >= MIN_SCORE
+    ]
+
+    return {
+        "query": query,
+        "policy_signal": "weak",
+        "matches": matches,
+        "explanation": (
+            "Refunds are referenced only in limited contexts such as "
+            "customer service recovery and fraud mitigation. "
+            "The policy does not define explicit refund timelines or guarantees."
+        )
+    }
+
+# =========================
+# CLI Usage
+# =========================
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if "--ingest" in sys.argv:
+        chunk_and_upload_policy()
+    else:
+        test_query = "Can I get a refund after 30 days?"
+        result = retrieve_refund_policy(test_query)
+
+        print("\nQuery:", result["query"])
+        print("Policy Signal:", result["policy_signal"])
+        print("Explanation:", result["explanation"])
+        print("\nMatches:\n")
+
+        for i, match in enumerate(result["matches"], start=1):
+            print(f"{i}. Score: {match['score']:.4f}")
+            print(f"   Section: {match['metadata'].get('section')}")
+            print(f"   Chunk ID: {match['metadata'].get('chunk_id')}")
+            print()
