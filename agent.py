@@ -1,299 +1,331 @@
+"""
+Agentic E-Commerce Refund Orchestrator
+"""
+
 import os
-import traceback
+from typing import Annotated, Optional, Literal
+from pydantic import BaseModel, Field
+
 from dotenv import load_dotenv
-from typing import Annotated, Optional
-from pydantic import BaseModel
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
-from langchain_core.tools import tool
-from langgraph.errors import Interrupt
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import InMemorySaver
+
+from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, SystemMessage
 from langchain.chat_models import init_chat_model
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+
 from pinecone import Pinecone
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from langchain_core.messages import HumanMessage
-from langgraph.types import Command
-from langgraph.types import interrupt
-from typing import Literal
-from langgraph.checkpoint.memory import InMemorySaver
-from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
 
-
-# Load environment variables
+# ------------------------------------------------------------------
+# ENV
+# ------------------------------------------------------------------
 load_dotenv()
 
-# Ensure envionment variables are set
-required_env_vars = (
-    "PINECONE_API_KEY",
-    "OPENAI_API_KEY"
-)
-debug_env_vars = (
-    "LANGSMITH_PROJECT",
-    "LANGSMITH_API_KEY",
-    "LANGSMITH_ENDPOINT",
-    "LANGSMITH_TRACING"
-)
-for r in required_env_vars:
-    if r not in os.environ:
-        raise EnvironmentError(f"Missing required environment variable: {r}")
-for d in debug_env_vars:
-    if d not in os.environ:
-        print(f"Warning: Missing debug environment variable: {d}")
-
-# Initialize model
-model = init_chat_model("openai:gpt-4o-mini")
-
-# ========================== Pinecone Setup ==========================
-
-pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-
-# Must match dimensions for OpenAIEmbeddings
-index = pc.Index("project-6-ecommerce-agent")
-
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-large",
-    dimensions=1024
-)
-
-vectorstore = PineconeVectorStore(
-    index=index,
-    embedding=embeddings,
-    text_key="text"
-)
-
-# ========================== Tools ==========================
-
-@tool
-def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
-    """
-    Fetches Gold-layer order and risk data for a given user and order.
-    This is a mock implementation used for offline demos and testing.
-    """
-    return fetch_from_snowflake (user_id, order_id)
-
-@tool
-def fetch_from_pinecone(item_category: str) -> dict:
-    """
-    Retrieves the refund policy clause for the given item_category.
-    Only call this **after** fetching Snowflake data to get item_category.
-    """
-    results = vectorstore.similarity_search(
-        query=item_category,
-        k=1
-    )
-    if not results:
-        return {"policy_clause": "No refund policy found for this category."}
-
-    return {"policy_clause": results[0].page_content}
-
-tools = [fetch_from_snowflake, fetch_from_pinecone]
-
-# ====================== Create Agent =======================
-
-class RefundPolicy(BaseModel):
-    policy_clause: str
-
-agent = create_agent(
-    name="refund-policy-agent",
-    model=model,
-    tools=tools,
-    response_format=ToolStrategy(RefundPolicy)
-)
-
-# ========================== State ==========================
+# ------------------------------------------------------------------
+# STATE
+# ------------------------------------------------------------------
 
 class AgentState(BaseModel):
     messages: Annotated[list[AnyMessage], add_messages]
 
     # routing
-    intent: Optional[str] = None
-    human_review_required: bool = False
+    request_type: Optional[Literal["policy", "sensitive"]] = None
 
     # identity
-    user_id: Optional[str] = None   # Must consider starting from scratch
-    order_id: Optional[str] = None
-    identity_verified: bool = False
+    username: Optional[str] = None
+    email: Optional[str] = None
+    verified: bool = False
+    attempts: int = 0
 
-    # order context (Gold)
-    item_category: Optional[str] = None
-    order_date: Optional[str] = None
-    item_price_usd: Optional[float] = None
- 
-    # fraud signals (Gold)
-    refund_count_window: Optional[int] = None
-    returnless_refund_count_window: Optional[int] = None
-    chargeback_flag: Optional[bool] = None
-    address_distance_miles: Optional[float] = None
+    # snowflake (gold layer)
+    user_info: Optional[dict] = None
 
-    # Policy
-    policy_clause: Optional[str] = None
+    # risk
+    is_risky: Optional[bool] = None
 
-    # Explanation
-    decision_summary: Optional[dict] = None
+    # refund decision
+    refund_route: Optional[Literal["Impossible", "Risky", "Trusted"]] = None
+    refund_decision_reasoning: Optional[str] = None
 
-# ========================== Nodes ==========================
 
-# Intent detection
-def intent_node(state: AgentState) -> dict:
-    last_message = state.messages[-1].content.lower()
-    if "refund" in last_message.lower():
-        return {"intent": "refund"}
-    else:
-        return {"intent": "other"}
+# ------------------------------------------------------------------
+# TOOLS (SAFE MOCKS)
+# ------------------------------------------------------------------
 
-# Handle cases where the user needs to verify who they are, such as PII
-# or financial information
-def identity_gate_node(state: AgentState) -> dict:
-    if state.identity_verified:
-        return {}
-    data = interrupt({"message": "Verify identity (email/password)"})
-    print(data)
-    # resume with data
-    return {
-        "identity_verified": data.get("identity_verified"),
-        "user_id": "user_123",
-        "order_id": "order_456",
-        "email": data.get("email")
-    }
+@tool
+def fetch_policy_tool(query: str) -> str:
+    """
+    Fetch refund policy text using Pinecone (RAG).
+    """
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    index = pc.Index("project-6-ecommerce-agent")
 
-# Fetch the order date, item category, and transactional data (even user login)
-# via Pydantic-validated models
-def snowflake_node(state: AgentState) -> dict:   
-    data = fetch_from_snowflake(state.user_id, state.order_id)   
-    return data
-
-# Retrieve policy clause via Pinecone
-def pinecone_node(state: AgentState) -> dict:
-    if not state.item_category:
-        return {"policy_clause": "No policy available"}
-    return fetch_from_pinecone(state.item_category) 
-
-# Retrieves the order based on the user, and order id
-# Crucially, it calls the Snowflake and Pinecone tools sequentially
-# using LLM commands. This may be probablistic and not recommended.
-def retrieval_agent_node(state: AgentState) -> dict:
-    # Prepare a prompt context combining needed state
-    user_input = (
-        f"User said: {state.messages[-1].content}\n"
-        f"User ID: {state.user_id}, Order ID: {state.order_id}\n"
-        # f"Item Category: {state.item_category}"
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-large",
+        dimensions=1024
     )
 
-    result = agent.invoke({
-        "input": user_input,
-        "messages": state.messages,
-    })
-    # Extract structured policy if present
-    structured = result.get("structured_response")
-    if structured and "policy_clause" in structured:
-        return {"policy_clause": structured["policy_clause"]}
+    vectorstore = PineconeVectorStore(
+        index=index,
+        embedding=embeddings,
+        text_key="text"
+    )
 
-    # Fallback: parse from last model message
-    last_msg = result["messages"][-1].content
-    return {"policy_clause": last_msg}
+    results = vectorstore.similarity_search(query, k=1)
+    if not results:
+        return "No relevant refund policy found."
 
-# Execute fraud and abuse signals.
-def fraud_detection_node(state: AgentState) -> dict:
-    if state.chargeback_flag:
-        return {"human_review_required": True}
-    if state.refund_count_window and state.refund_count_window > 3:
-        return {"human_review_required": True}
-    if state.address_distance_miles and state.address_distance_miles > 500:
-        return {"human_review_required": True}
-    
-    return {}
+    return results[0].page_content
 
-# Generate an explanation for the decision path
-def decision_summary_node(state: AgentState) -> dict:
-    summary = {
-        "reason": "Refund request within policy window",
-        "policy": state.policy_clause,
-        "refund_count_window": state.refund_count_window,
-        "chargeback_flag": state.chargeback_flag,
-        "geo_distance_miles": state.address_distance_miles,
-        "human_review_required": state.human_review_required
+
+@tool
+def verify_user_tool(username: str, email: str) -> bool:
+    """
+    Mock identity verification.
+    """
+    return username != "" and email != ""
+
+
+@tool
+def fetch_snowflake_tool(username: str, email: str) -> dict:
+    """
+    Mock Gold-layer Snowflake data.
+    """
+    return {
+        "days_since_purchase": 12,
+        "chargeback_amount": 0,
+        "refund_amount": 49.99,
+        "products": [("Wireless Headphones", "electronics")]
     }
-    return {"decision_summary": summary}
 
-# Final mandatory HITL review
-def human_review_node(state: AgentState) -> dict:
-    return {"human_review_required": True}
+
+@tool
+def calculate_risk_tool(chargeback_amount: float, refund_amount: float) -> bool:
+    """
+    Simple risk heuristic.
+    """
+    return chargeback_amount > 0 or refund_amount > 200
+
+
+# ------------------------------------------------------------------
+# NODES
+# ------------------------------------------------------------------
+
+def classify_request_node(state: AgentState):
+    """
+    Policy vs Sensitive router.
+    """
+    text = state.messages[-1].content.lower()
+
+    if any(word in text for word in ["refund", "return", "order", "charged", "my account"]):
+        return {"request_type": "sensitive"}
+
+    return {"request_type": "policy"}
+
+
+def respond_policy_node(state: AgentState):
+    """
+    Answer policy-only questions using Pinecone.
+    """
+    model = init_chat_model("openai:gpt-4o-mini", temperature=0.7)
+
+    agent = create_agent(
+        model=model,
+        tools=[fetch_policy_tool],
+        system_prompt="Answer the user's question using policy context only.",
+        name="policy_agent"
+    )
+
+    response = agent.invoke({"messages": state.messages})
+    return {"messages": [response["messages"][-1]]}
+
+
+def collect_credentials_node(state: AgentState):
+    """
+    Interrupt to collect identity info.
+    """
+    if state.attempts >= 3:
+        return {
+            "messages": [AIMessage(content="Too many failed attempts. Contact support.")],
+            "verified": False
+        }
+
+    payload = {
+        "type": "identity_verification",
+        "attempt": state.attempts + 1,
+        "fields": ["username", "email"]
+    }
+
+    user_data = interrupt(payload)
+
+    return {
+        "username": user_data.get("username"),
+        "email": user_data.get("email")
+    }
+
+
+def verify_user_node(state: AgentState):
+    """
+    Verify identity.
+    """
+    attempts = state.attempts + 1
+
+    verified = verify_user_tool.invoke({
+        "username": state.username or "",
+        "email": state.email or ""
+    })
+
+    if verified:
+        return {"verified": True, "attempts": 0}
+
+    if attempts >= 3:
+        return {
+            "verified": False,
+            "attempts": 0,
+            "messages": [AIMessage(content="Verification failed. Contact support.")]
+        }
+
+    return {"verified": False, "attempts": attempts}
+
+
+def fetch_snowflake_node(state: AgentState):
+    """
+    Fetch Gold-layer data.
+    """
+    user_info = fetch_snowflake_tool.invoke({
+        "username": state.username,
+        "email": state.email
+    })
+
+    return {"user_info": user_info}
+
+
+def risk_scoring_node(state: AgentState):
+    """
+    Risk classification.
+    """
+    info = state.user_info or {}
+    is_risky = calculate_risk_tool.invoke({
+        "chargeback_amount": info.get("chargeback_amount", 0),
+        "refund_amount": info.get("refund_amount", 0)
+    })
+
+    return {"is_risky": is_risky}
+
+
+class RefundRoute(BaseModel):
+    decision: Literal["Impossible", "Risky", "Trusted"]
+    reason: str = Field(max_length=200)
+
+
+def refund_routing_node(state: AgentState):
+    """
+    Final refund routing decision.
+    """
+    if state.is_risky:
+        return {
+            "refund_route": "Risky",
+            "refund_decision_reasoning": "Risk signals detected.",
+            "messages": [AIMessage(content="Your request is under human review.")]
+        }
+
+    return {
+        "refund_route": "Trusted",
+        "refund_decision_reasoning": "Request meets refund policy.",
+        "messages": [AIMessage(content="Your refund has been approved.")]
+    }
+
+
+def human_review_node(state: AgentState):
+    """
+    HITL interrupt.
+    """
+    payload = {
+        "reason": state.refund_decision_reasoning,
+        "fields": [{"decision": "approve or reject"}]
+    }
+
+    decision = interrupt(payload).get("decision", "reject")
+
+    if decision == "approve":
+        return {"messages": [AIMessage(content="Refund approved by agent.")]}
+    return {"messages": [AIMessage(content="Refund denied by agent.")]}
+
+
+# ------------------------------------------------------------------
+# GRAPH
+# ------------------------------------------------------------------
 
 def build_graph():
     builder = StateGraph(AgentState)
 
-    builder.add_node("intent", intent_node)
-    builder.add_node("identity", identity_gate_node)
-    builder.add_node("snowflake", snowflake_node)
-    builder.add_node("pinecone", pinecone_node)
-    builder.add_node("retrieval", retrieval_agent_node)
-    builder.add_node("fraud", fraud_detection_node)
-    builder.add_node("summary", decision_summary_node)
+    builder.add_node("classify", classify_request_node)
+    builder.add_node("policy", respond_policy_node)
+    builder.add_node("collect_identity", collect_credentials_node)
+    builder.add_node("verify", verify_user_node)
+    builder.add_node("snowflake", fetch_snowflake_node)
+    builder.add_node("risk", risk_scoring_node)
+    builder.add_node("route", refund_routing_node)
     builder.add_node("human_review", human_review_node)
 
-    builder.add_edge(START, "intent")
-    builder.add_edge("intent", "identity")
-    # builder.add_edge("identity", "snowflake")
-    # builder.add_edge("snowflake", "pinecone")
-    # builder.add_edge("pinecone", "fraud")
-    builder.add_edge("identity", "retrieval")
-    builder.add_edge("retrieval", "fraud")
-    builder.add_edge("fraud", "summary")
+    builder.add_edge(START, "classify")
 
     builder.add_conditional_edges(
-        "summary", 
-        lambda s: "human_review" if s.human_review_required else END,
+        "classify",
+        lambda s: s.request_type,
         {
-            "human_review": "human_review",
-            END: END,
-        },
+            "policy": "policy",
+            "sensitive": "collect_identity"
+        }
     )
-   
+
+    builder.add_edge("policy", END)
+
+    builder.add_edge("collect_identity", "verify")
+
+    builder.add_conditional_edges(
+        "verify",
+        lambda s: "verified" if s.verified else "retry",
+        {
+            "verified": "snowflake",
+            "retry": "collect_identity"
+        }
+    )
+
+    builder.add_edge("snowflake", "risk")
+    builder.add_edge("risk", "route")
+
+    builder.add_conditional_edges(
+        "route",
+        lambda s: "human" if s.refund_route == "Risky" else END,
+        {
+            "human": "human_review",
+            END: END
+        }
+    )
+
     builder.add_edge("human_review", END)
 
-    # InMemoryServer needed to maintain state during interrupts
     return builder.compile(checkpointer=InMemorySaver())
 
-def interactive_stateful_cli():
-    graph = build_graph()
-    config = {"configurable": {"thread_id": "test-1"}}  # Needed for InMemorySaver()
-    state = AgentState(messages=[])
 
-    # Get and add user's first message
-    user_input = input(
-        "\nHello, I am your refund agent! How can I help you today? "
-    )
-    state.messages.append(HumanMessage(content=user_input))
-    # Call graph from user's initial message
-    result = graph.invoke(state, config=config)
-
-    # If an interrupt was detected (i.e. need identity verification, handle it)
-    if "__interrupt__" in result:
-        interrupt_obj = result["__interrupt__"][0]
-
-        payload = interrupt_obj.value
-        print("\n[AGENT]:", payload["message"])
-
-        # Verify user credentials for their identity (TODO sample creds for now)
-        email = input("Email: ")
-        password = input("Password: ")
-
-        # Resume
-        result = graph.invoke(
-            Command(resume={"email": email, "identity_verified": True}),
-            config=config
-        )
-
-    # On completion of agent cycle, print the agent's decision
-    if "decision_summary" in result:
-        print("\nAgent decision summary:")
-        print(result["decision_summary"])
-
-def main():
-    print("=== Running Agent Test ===")
-    interactive_stateful_cli()
+# ------------------------------------------------------------------
+# ENTRY POINT (for CLI testing)
+# ------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    graph = build_graph()
+    config = {"configurable": {"thread_id": "demo"}}
+
+    msg = input("User: ")
+    result = graph.invoke(
+        AgentState(messages=[HumanMessage(content=msg)]),
+        config=config
+    )
+
+    print(result)
