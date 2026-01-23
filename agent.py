@@ -187,32 +187,13 @@ def pinecone_node(state: AgentState) -> dict:
 # Crucially, it calls the Snowflake and Pinecone tools sequentially
 # using LLM commands. This may be probablistic and not recommended.
 def retrieval_agent_node(state: AgentState) -> dict:
-    # model_input = f"""
-    #     The user's user_id is {state.user_id}.\n
-    #     Query the list of their orders from the Snowflake Gold database.\n
-    # """
-    # response = agent.invoke({
-    #     "input": model_input
-    # })
-    # order_list = response.content
     order_list = snowflake_fetch_user_orders(state.user_id)
     # Interrupt to see which item the user wants to return
     return_transaction_id = interrupt({
         f"Which of these transactions would you like to return? {order_list}\nEnter the transaction id"
     })
-    # model_input = f"""
-    #     The user wants to refund the order with transaction_id f{return_transaction_id}.\n
-    #     Query the Snowflake Gold database and return the order's item_category.
-    #     Once you have the item_category, query the Pinecone vectorstore to get its return policy.
-    # """
-    # # Call the model
-    # response = agent.invoke({
-    #     "input": model_input
-    # })
-    # return_policy = response.content
     order = snowflake_fetch_order(return_transaction_id)
     item_category = order.get("category")
-    # item_category = snowflake_fetch_item_category(return_transaction_id)
     results = vectorstore.similarity_search(
         query=item_category,
         k=1
@@ -228,14 +209,6 @@ def retrieval_agent_node(state: AgentState) -> dict:
         "refund_count_window": snowflake_count_refunded(state.user_id),
         "order_id": return_transaction_id
     }
-    # # Extract structured policy if present
-    # structured = result.get("structured_response")
-    # if structured and "policy_clause" in structured:
-    #     return {"policy_clause": structured["policy_clause"]}
-
-    # # Fallback: parse from last model message
-    # last_msg = result["messages"][-1].content
-    # return {"policy_clause": last_msg}
 
 # Execute fraud and abuse signals.
 def fraud_detection_node(state: AgentState) -> dict:
@@ -256,7 +229,7 @@ def decision_summary_node(state: AgentState) -> dict:
         "refund_count_window": state.refund_count_window,
         "chargeback_flag": state.chargeback_flag,
         "geo_distance_miles": state.address_distance_miles,
-        "human_review_required": state.human_review_required
+        "human_review_required": True
     }
     return {"decision_summary": summary}
 
@@ -273,7 +246,6 @@ def build_graph():
     builder.add_node("intent", intent_node)
     builder.add_node("identity", identity_gate_node)
     builder.add_node("snowflake", snowflake_node)
-    # builder.add_node("pinecone", pinecone_node)
     builder.add_node("retrieval", retrieval_agent_node)
     builder.add_node("fraud", fraud_detection_node)
     builder.add_node("summary", decision_summary_node)
