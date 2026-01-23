@@ -20,7 +20,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 
-from adapters.snowflake_adapter import fetch_from_snowflake, snowflake_verify_user_email
+from adapters.snowflake_adapter import snowflake_verify_user_email, snowflake_fetch_user_orders, snowflake_fetch_item_category, snowflake_fetch_order, snowflake_update_order_refund, snowflake_count_refunded
 
 # Load environment variables
 load_dotenv()
@@ -43,9 +43,6 @@ for d in debug_env_vars:
     if d not in os.environ:
         print(f"Warning: Missing debug environment variable: {d}")
 
-# Initialize model
-model = init_chat_model("openai:gpt-4o-mini")
-
 # ========================== Pinecone Setup ==========================
 
 pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
@@ -67,12 +64,23 @@ vectorstore = PineconeVectorStore(
 # ========================== Tools ==========================
 
 @tool
-def fetch_from_snowflake(user_id: str, order_id: str) -> dict:
+def fetch_user_orders(user_id: str) -> dict:
     """
-    Fetches Gold-layer order and risk data for a given user and order.
-    This is a mock implementation used for offline demos and testing.
+    Queries the user's orders from the Snowflake gold database
+    by their user_id, returning a list.
     """
-    return fetch_from_snowflake(user_id, order_id)
+    print("fetch_user_orders called!")
+    return snowflake_fetch_user_orders(user_id)
+
+@tool
+def fetch_item_category(transaction_id: str) -> str | None:
+    """
+    Queries the Snowflake gold database to get the item_category.
+    After this, call the tool fetch_from_pinecone - unless you
+    received a None type here - in which case, end and return.
+    """
+    print("fetch_item_category called!")
+    return snowflake_fetch_item_category(transaction_id);
 
 @tool
 def fetch_from_pinecone(item_category: str) -> dict:
@@ -80,6 +88,7 @@ def fetch_from_pinecone(item_category: str) -> dict:
     Retrieves the refund policy clause for the given item_category.
     Only call this **after** fetching Snowflake data to get item_category.
     """
+    print("fetch_from_pinecone called!")
     results = vectorstore.similarity_search(
         query=item_category,
         k=1
@@ -89,7 +98,7 @@ def fetch_from_pinecone(item_category: str) -> dict:
 
     return {"policy_clause": results[0].page_content}
 
-tools = [fetch_from_snowflake, fetch_from_pinecone]
+tools = [fetch_user_orders, fetch_item_category, fetch_from_pinecone]
 
 # ====================== Create Agent =======================
 
@@ -97,8 +106,8 @@ class RefundPolicy(BaseModel):
     policy_clause: str
 
 agent = create_agent(
-    name="refund-policy-agent",
-    model=model,
+    name="ecommerce_agent",
+    model="openai:gpt-4o-mini",
     tools=tools,
     response_format=ToolStrategy(RefundPolicy)
 )
@@ -118,6 +127,7 @@ class AgentState(BaseModel):
     identity_verified: bool = False
 
     # order context (Gold)
+    orders: Optional[list[dict]] = None
     item_category: Optional[str] = None
     order_date: Optional[str] = None
     item_price_usd: Optional[float] = None
@@ -138,8 +148,16 @@ class AgentState(BaseModel):
 
 # Intent detection
 def intent_node(state: AgentState) -> dict:
-    last_message = state.messages[-1].content.lower()
-    if "refund" in last_message.lower():
+    messages = state.messages
+    if not messages:
+        return {}
+    
+    last_msg = messages[-1]
+    content = last_msg.content[0]['text']
+
+    # Detect intent
+    print(content)
+    if "refund" in content.lower():
         return {"intent": "refund"}
     else:
         return {"intent": "other"}
@@ -149,21 +167,15 @@ def intent_node(state: AgentState) -> dict:
 def identity_gate_node(state: AgentState) -> dict:
     if state.identity_verified:
         return {}
-    data = interrupt({"message": "Verify identity (email/password)"})
-    print(data)
-    # resume with data
-    return {
-        "identity_verified": data.get("identity_verified"),
-        "user_id": "user_123",
-        "order_id": "order_456",
-        "email": data.get("email")
-    }
+    email = interrupt({"message": "Verify identity (email)"})
+    return snowflake_verify_user_email(email)
 
 # Fetch the order date, item category, and transactional data (even user login)
 # via Pydantic-validated models
-def snowflake_node(state: AgentState) -> dict:   
-    data = fetch_from_snowflake(state.user_id, state.order_id)   
-    return data
+def snowflake_node(state: AgentState) -> dict:
+    user_orders = snowflake_fetch_user_orders(state.user_id)
+    print(user_orders)
+    return {"orders": user_orders}
 
 # Retrieve policy clause via Pinecone
 def pinecone_node(state: AgentState) -> dict:
@@ -175,25 +187,55 @@ def pinecone_node(state: AgentState) -> dict:
 # Crucially, it calls the Snowflake and Pinecone tools sequentially
 # using LLM commands. This may be probablistic and not recommended.
 def retrieval_agent_node(state: AgentState) -> dict:
-    # Prepare a prompt context combining needed state
-    user_input = (
-        f"User said: {state.messages[-1].content}\n"
-        f"User ID: {state.user_id}, Order ID: {state.order_id}\n"
-        # f"Item Category: {state.item_category}"
-    )
-
-    result = agent.invoke({
-        "input": user_input,
-        "messages": state.messages,
+    # model_input = f"""
+    #     The user's user_id is {state.user_id}.\n
+    #     Query the list of their orders from the Snowflake Gold database.\n
+    # """
+    # response = agent.invoke({
+    #     "input": model_input
+    # })
+    # order_list = response.content
+    order_list = snowflake_fetch_user_orders(state.user_id)
+    # Interrupt to see which item the user wants to return
+    return_transaction_id = interrupt({
+        f"Which of these transactions would you like to return? {order_list}\nEnter the transaction id"
     })
-    # Extract structured policy if present
-    structured = result.get("structured_response")
-    if structured and "policy_clause" in structured:
-        return {"policy_clause": structured["policy_clause"]}
+    # model_input = f"""
+    #     The user wants to refund the order with transaction_id f{return_transaction_id}.\n
+    #     Query the Snowflake Gold database and return the order's item_category.
+    #     Once you have the item_category, query the Pinecone vectorstore to get its return policy.
+    # """
+    # # Call the model
+    # response = agent.invoke({
+    #     "input": model_input
+    # })
+    # return_policy = response.content
+    order = snowflake_fetch_order(return_transaction_id)
+    item_category = order.get("category")
+    # item_category = snowflake_fetch_item_category(return_transaction_id)
+    results = vectorstore.similarity_search(
+        query=item_category,
+        k=1
+    )
+    policy_clause = "No refund policy found for this category."
+    if results:
+        policy_clause = results[0].page_content
+    # Mark order as refunded
+    snowflake_update_order_refund(return_transaction_id)
 
-    # Fallback: parse from last model message
-    last_msg = result["messages"][-1].content
-    return {"policy_clause": last_msg}
+    return {
+        "policy_clause": policy_clause,
+        "refund_count_window": snowflake_count_refunded(state.user_id),
+        "order_id": return_transaction_id
+    }
+    # # Extract structured policy if present
+    # structured = result.get("structured_response")
+    # if structured and "policy_clause" in structured:
+    #     return {"policy_clause": structured["policy_clause"]}
+
+    # # Fallback: parse from last model message
+    # last_msg = result["messages"][-1].content
+    # return {"policy_clause": last_msg}
 
 # Execute fraud and abuse signals.
 def fraud_detection_node(state: AgentState) -> dict:
@@ -220,6 +262,9 @@ def decision_summary_node(state: AgentState) -> dict:
 
 # Final mandatory HITL review
 def human_review_node(state: AgentState) -> dict:
+    decision = interrupt({f"Human review for transaction {state.order_id} required: yes or no?"})
+    if decision and decision.lower() == "yes":
+        return {"human_review_required": False}
     return {"human_review_required": True}
 
 def build_graph():
@@ -228,7 +273,7 @@ def build_graph():
     builder.add_node("intent", intent_node)
     builder.add_node("identity", identity_gate_node)
     builder.add_node("snowflake", snowflake_node)
-    builder.add_node("pinecone", pinecone_node)
+    # builder.add_node("pinecone", pinecone_node)
     builder.add_node("retrieval", retrieval_agent_node)
     builder.add_node("fraud", fraud_detection_node)
     builder.add_node("summary", decision_summary_node)
@@ -236,10 +281,8 @@ def build_graph():
 
     builder.add_edge(START, "intent")
     builder.add_edge("intent", "identity")
-    # builder.add_edge("identity", "snowflake")
-    # builder.add_edge("snowflake", "pinecone")
-    # builder.add_edge("pinecone", "fraud")
-    builder.add_edge("identity", "retrieval")
+    builder.add_edge("identity", "snowflake")
+    builder.add_edge("snowflake", "retrieval")
     builder.add_edge("retrieval", "fraud")
     builder.add_edge("fraud", "summary")
 

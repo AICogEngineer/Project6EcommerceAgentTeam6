@@ -11,3 +11,6 @@ venv/
 
 # OS junk
 .DS_Store
+
+# Langgraph
+.langgraph_api/

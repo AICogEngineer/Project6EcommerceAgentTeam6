@@ -2,7 +2,7 @@
     "dependencies": ["."],
     "graphs": {
         "ecommerce_agent": {
-            "path": "agent.agent:build_graph"
+            "path": "agent:build_graph"
         }
     },
     "env": ".env"
